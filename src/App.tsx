@@ -188,6 +188,139 @@ function findNearestForeground(
   return Number.isFinite(bestDistance) ? { x: bestX, y: bestY } : null;
 }
 
+function erodeMask(mask: Uint8Array, width: number, height: number, radius: number) {
+  const next = new Uint8Array(width * height);
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      let keep = 1;
+      for (let oy = -radius; oy <= radius && keep; oy += 1) {
+        for (let ox = -radius; ox <= radius; ox += 1) {
+          const sx = x + ox;
+          const sy = y + oy;
+          if (sx < 0 || sx >= width || sy < 0 || sy >= height || !mask[sy * width + sx]) {
+            keep = 0;
+            break;
+          }
+        }
+      }
+      next[y * width + x] = keep;
+    }
+  }
+
+  return next;
+}
+
+function dilateMask(mask: Uint8Array, width: number, height: number, radius: number) {
+  const next = new Uint8Array(width * height);
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      let keep = 0;
+      for (let oy = -radius; oy <= radius && !keep; oy += 1) {
+        for (let ox = -radius; ox <= radius; ox += 1) {
+          const sx = x + ox;
+          const sy = y + oy;
+          if (sx >= 0 && sx < width && sy >= 0 && sy < height && mask[sy * width + sx]) {
+            keep = 1;
+            break;
+          }
+        }
+      }
+      next[y * width + x] = keep;
+    }
+  }
+
+  return next;
+}
+
+function keepLargestComponent(mask: Uint8Array, width: number, height: number) {
+  const visited = new Uint8Array(width * height);
+  const best: number[] = [];
+  const queue: number[] = [];
+
+  for (let start = 0; start < mask.length; start += 1) {
+    if (!mask[start] || visited[start]) continue;
+
+    const component: number[] = [];
+    queue.length = 0;
+    queue.push(start);
+    visited[start] = 1;
+
+    for (let cursor = 0; cursor < queue.length; cursor += 1) {
+      const index = queue[cursor];
+      const x = index % width;
+      const y = Math.floor(index / width);
+      component.push(index);
+
+      const neighbors = [index - 1, index + 1, index - width, index + width];
+      neighbors.forEach((next) => {
+        const nx = next % width;
+        const ny = Math.floor(next / width);
+        const connected = next >= 0 && next < mask.length && Math.abs(nx - x) + Math.abs(ny - y) === 1;
+        if (connected && mask[next] && !visited[next]) {
+          visited[next] = 1;
+          queue.push(next);
+        }
+      });
+    }
+
+    if (component.length > best.length) {
+      best.length = 0;
+      best.push(...component);
+    }
+  }
+
+  const next = new Uint8Array(width * height);
+  best.forEach((index) => {
+    next[index] = 1;
+  });
+  return next;
+}
+
+function simplifySilhouette(mask: Uint8Array, width: number, height: number) {
+  const cell = clamp(Math.round(Math.min(width, height) / 92), 5, 12);
+  const next = new Uint8Array(width * height);
+
+  for (let y = 0; y < height; y += cell) {
+    for (let x = 0; x < width; x += cell) {
+      let filled = 0;
+      let total = 0;
+      const maxY = Math.min(height, y + cell);
+      const maxX = Math.min(width, x + cell);
+
+      for (let py = y; py < maxY; py += 1) {
+        for (let px = x; px < maxX; px += 1) {
+          filled += mask[py * width + px];
+          total += 1;
+        }
+      }
+
+      if (filled / Math.max(total, 1) < 0.34) continue;
+
+      for (let py = y; py < maxY; py += 1) {
+        for (let px = x; px < maxX; px += 1) {
+          next[py * width + px] = 1;
+        }
+      }
+    }
+  }
+
+  return next;
+}
+
+function preprocessSilhouette(mask: Uint8Array, width: number, height: number) {
+  let next = keepLargestComponent(mask, width, height);
+  next = erodeMask(next, width, height, 1);
+  next = keepLargestComponent(next, width, height);
+  next = dilateMask(next, width, height, 2);
+  next = erodeMask(next, width, height, 1);
+  next = simplifySilhouette(next, width, height);
+  next = dilateMask(next, width, height, 1);
+  next = erodeMask(next, width, height, 1);
+  return keepLargestComponent(next, width, height);
+}
+
 function downloadBlob(blob: Blob, filename: string) {
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
@@ -285,7 +418,7 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
     [0, 0, 0],
   ).map((value) => value / Math.max(cornerSamples.length, 1));
 
-  const mask = new Uint8Array(width * height);
+  let mask = new Uint8Array(width * height);
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
       const i = (y * width + x) * 4;
@@ -300,6 +433,8 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
       mask[y * width + x] = foreground ? 1 : 0;
     }
   }
+
+  mask = preprocessSilhouette(mask, width, height);
 
   const edgeStrength = new Float32Array(width * height);
   const edgeAngle = new Float32Array(width * height);
@@ -338,7 +473,34 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
   const posterGrid = clamp(Math.round(maxDotSize * 0.86), 4, 7);
   const flowAngle = sampleRange(random, -0.35, 0.35) + (random() > 0.5 ? 0 : Math.PI);
   const edgeDensityBoost = 3 + random() * 2;
+  const jointStrength = new Float32Array(width * height);
+  const bodyMass = new Float32Array(width * height);
   const dots: Dot[] = [];
+
+  const jointRadius = Math.max(6, Math.round(baseStride * 1.45));
+  for (let y = jointRadius; y < height - jointRadius; y += 1) {
+    for (let x = jointRadius; x < width - jointRadius; x += 1) {
+      const index = y * width + x;
+      if (!mask[index] || edgeStrength[index] > 0.08) continue;
+
+      let edgeCount = 0;
+      let fillCount = 0;
+      let samples = 0;
+      for (let oy = -jointRadius; oy <= jointRadius; oy += 3) {
+        for (let ox = -jointRadius; ox <= jointRadius; ox += 3) {
+          const sampleIndex = (y + oy) * width + x + ox;
+          fillCount += mask[sampleIndex];
+          edgeCount += edgeStrength[sampleIndex] > 0.08 ? 1 : 0;
+          samples += 1;
+        }
+      }
+
+      const fillRatio = fillCount / Math.max(samples, 1);
+      const edgeRatio = edgeCount / Math.max(samples, 1);
+      bodyMass[index] = fillRatio;
+      jointStrength[index] = fillRatio > 0.18 && fillRatio < 0.72 ? clamp(edgeRatio * 3.4, 0, 1) : 0;
+    }
+  }
 
   const snapToPosterGrid = (value: number) => Math.round(value / posterGrid) * posterGrid;
 
@@ -403,6 +565,7 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
       const inMask = mask[index] === 1;
       const edge = edgeStrength[index];
       const nearEdge = edge > 0.08;
+      const joint = jointStrength[index] > 0.28;
       const scatterCandidate = !inMask && nearEdge && random() < noise * 0.18;
 
       if (!inMask && !scatterCandidate) continue;
@@ -410,8 +573,10 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
       const regionChance = inMask
         ? nearEdge
           ? baseDensity * edgeDensityBoost
-          : baseDensity * 0.34
-        : baseDensity * 0.18;
+          : joint
+            ? baseDensity * 1.22
+            : baseDensity * 0.08
+        : baseDensity * 0.12;
 
       if (random() > clamp(regionChance, 0.03, 0.96)) continue;
 
@@ -422,12 +587,17 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
       const dotX = px + Math.cos(localFlow) * flowDistance + Math.cos(normal) * normalDistance;
       const dotY = py + Math.sin(localFlow) * flowDistance + Math.sin(normal) * normalDistance;
       const size = nearEdge
-        ? sampleRange(random, Math.max(3.2, maxDotSize * 0.62), maxDotSize)
-        : sampleRange(random, 1, Math.max(2.4, maxDotSize * 0.52));
-      const alpha = clamp(nearEdge ? sampleRange(random, 0.72, 1) : sampleRange(random, 0.28, 0.68), 0.18, 1);
-      const shape = pickParticleShape(random, nearEdge ? "edge" : "inside");
+        ? sampleRange(random, 1.2, Math.max(3.2, maxDotSize * 0.5))
+        : joint
+          ? sampleRange(random, 2.2, Math.max(4.2, maxDotSize * 0.62))
+          : sampleRange(random, 1, Math.max(2.1, maxDotSize * 0.34));
+      const shape = nearEdge
+        ? pickSmallDotShape(random)
+        : joint
+          ? pickParticleShape(random, "edge")
+          : pickSmallDotShape(random);
 
-      pushDot(dotX, dotY, size, alpha, shape);
+      pushDot(dotX, dotY, size, 1, shape);
 
       if (nearEdge && inMask) {
         const extraCount = 1 + Math.floor(random() * 3);
@@ -438,9 +608,9 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
           pushDot(
             px + Math.cos(echoFlow) * echoDistance + sampleRange(random, -2.5, 2.5),
             py + Math.sin(echoFlow) * echoDistance + sampleRange(random, -2.5, 2.5),
-            sampleRange(random, Math.max(2.8, maxDotSize * 0.48), maxDotSize),
-            sampleRange(random, 0.62, 0.96),
-            pickParticleShape(random, "edge"),
+            sampleRange(random, 1.2, Math.max(3.2, maxDotSize * 0.44)),
+            1,
+            pickSmallDotShape(random),
           );
         }
       }
@@ -475,9 +645,9 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
         pushDot(
           px + Math.cos(tangent) * along + Math.cos(normal) * lift,
           py + Math.sin(tangent) * along + Math.sin(normal) * lift,
-          sampleRange(random, Math.max(3.2, maxDotSize * 0.62), maxDotSize),
-          sampleRange(random, 0.74, 1),
-          pickParticleShape(random, "edge"),
+          sampleRange(random, 1.1, Math.max(3.4, maxDotSize * 0.42)),
+          1,
+          pickSmallDotShape(random),
         );
       }
 
@@ -493,6 +663,27 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
     }
   }
 
+  const jointStride = Math.max(4, Math.round(baseStride * 0.72));
+  for (let y = random() * jointStride; y < height; y += jointStride * sampleRange(random, 0.75, 1.2)) {
+    for (let x = random() * jointStride; x < width; x += jointStride * sampleRange(random, 0.75, 1.2)) {
+      const px = clamp(Math.round(x + sampleRange(random, -jointStride, jointStride)), 0, width - 1);
+      const py = clamp(Math.round(y + sampleRange(random, -jointStride, jointStride)), 0, height - 1);
+      const index = py * width + px;
+      if (!mask[index] || jointStrength[index] < 0.3 || random() > clamp(baseDensity * 0.82, 0.18, 0.78)) continue;
+
+      const count = 2 + Math.floor(random() * 4);
+      for (let i = 0; i < count; i += 1) {
+        pushDot(
+          px + sampleRange(random, -jointStride * 1.4, jointStride * 1.4),
+          py + sampleRange(random, -jointStride * 1.4, jointStride * 1.4),
+          sampleRange(random, 2, Math.max(4, maxDotSize * 0.68)),
+          1,
+          random() < 0.66 ? pickSmallDotShape(random) : pickMediumClusterShape(random),
+        );
+      }
+    }
+  }
+
   const structuralStride = Math.max(10, baseStride * 1.7);
   for (let y = random() * structuralStride; y < height; y += structuralStride * sampleRange(random, 0.8, 1.35)) {
     for (let x = random() * structuralStride; x < width; x += structuralStride * sampleRange(random, 0.8, 1.35)) {
@@ -502,7 +693,8 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
       if (!mask[index]) continue;
 
       const contour = edgeStrength[index] > 0.05;
-      const keepStructure = contour ? baseDensity * 0.62 : baseDensity * 0.34;
+      const bulkyPart = bodyMass[index] > 0.42;
+      const keepStructure = contour ? baseDensity * 0.24 : bulkyPart ? baseDensity * 0.72 : baseDensity * 0.1;
       if (random() > clamp(keepStructure, 0.1, 0.68)) continue;
 
       const tangent = edgeAngle[index] + Math.PI / 2;
@@ -514,7 +706,7 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
           ? Math.PI / 2
           : 0;
       const runLength = 2 + Math.floor(random() * 4);
-      const blockSize = sampleRange(random, contour ? 10 : 12, contour ? 20 : 24);
+      const blockSize = sampleRange(random, bulkyPart ? 14 : 8, bulkyPart ? 28 : 14);
       const start = -(runLength - 1) / 2;
 
       for (let i = 0; i < runLength; i += 1) {
@@ -530,11 +722,11 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
           by,
           blockSize * sampleRange(random, 0.85, 1.35),
           1,
-          random() < 0.7
+          bulkyPart && random() < 0.82
             ? axis === 0
               ? "solid-horizontal-rect"
               : "solid-vertical-rect"
-            : random() < 0.58
+            : random() < 0.36
               ? "solid-square"
               : axis === 0
                 ? "horizontal-line"
