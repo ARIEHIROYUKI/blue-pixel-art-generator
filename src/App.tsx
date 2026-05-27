@@ -4,7 +4,16 @@ import { Button } from "./components/ui/button";
 import { Label } from "./components/ui/label";
 import { Slider } from "./components/ui/slider";
 
-type DotShape = "circle" | "square";
+type DotShape =
+  | "circle"
+  | "square"
+  | "micro"
+  | "block-2"
+  | "block-3"
+  | "vertical-line"
+  | "horizontal-line"
+  | "l-shape"
+  | "solid-square";
 
 type Dot = {
   x: number;
@@ -35,7 +44,7 @@ const MAX_SOURCE_SIDE = 920;
 const DEFAULT_SETTINGS: Settings = {
   density: 52,
   noise: 24,
-  dotSize: 7,
+  dotSize: 8,
   color: "#1463ff",
   background: "#f8fafc",
   seed: 24891,
@@ -65,6 +74,107 @@ function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
 }
 
+function sampleRange(random: () => number, min: number, max: number) {
+  return min + random() * (max - min);
+}
+
+function pickSmallDotShape(random: () => number): DotShape {
+  const roll = random();
+  if (roll < 0.58) return "micro";
+  if (roll < 0.82) return "circle";
+  return "square";
+}
+
+function pickMediumClusterShape(random: () => number): DotShape {
+  const roll = random();
+  if (roll < 0.24) return "block-2";
+  if (roll < 0.42) return "block-3";
+  if (roll < 0.62) return "vertical-line";
+  if (roll < 0.82) return "horizontal-line";
+  return "l-shape";
+}
+
+function pickParticleShape(random: () => number, region: "edge" | "inside" | "scatter"): DotShape {
+  const roll = random();
+
+  if (region === "inside") {
+    if (roll < 0.9) return pickSmallDotShape(random);
+    if (roll < 0.99) return pickMediumClusterShape(random);
+    return "solid-square";
+  }
+
+  if (region === "edge") {
+    if (roll < 0.46) return pickSmallDotShape(random);
+    if (roll < 0.82) return pickMediumClusterShape(random);
+    return "solid-square";
+  }
+
+  if (roll < 0.7) return pickSmallDotShape(random);
+  if (roll < 0.9) return pickMediumClusterShape(random);
+  return "solid-square";
+}
+
+function clusterCells(shape: DotShape) {
+  if (shape === "block-2") {
+    return [
+      [-0.5, -0.5],
+      [0.5, -0.5],
+      [-0.5, 0.5],
+      [0.5, 0.5],
+    ];
+  }
+
+  if (shape === "block-3") {
+    return [
+      [-1, -1],
+      [0, -1],
+      [1, -1],
+      [-1, 0],
+      [0, 0],
+      [1, 0],
+      [-1, 1],
+      [0, 1],
+      [1, 1],
+    ];
+  }
+
+  if (shape === "vertical-line") return [[0, -1], [0, 0], [0, 1]];
+  if (shape === "horizontal-line") return [[-1, 0], [0, 0], [1, 0]];
+  if (shape === "l-shape") return [[-1, -1], [-1, 0], [-1, 1], [0, 1], [1, 1]];
+
+  return [];
+}
+
+function findNearestForeground(
+  mask: Uint8Array,
+  width: number,
+  height: number,
+  x: number,
+  y: number,
+  radius: number,
+) {
+  let bestX = x;
+  let bestY = y;
+  let bestDistance = Number.POSITIVE_INFINITY;
+
+  for (let oy = -radius; oy <= radius; oy += 1) {
+    for (let ox = -radius; ox <= radius; ox += 1) {
+      const sx = clamp(x + ox, 0, width - 1);
+      const sy = clamp(y + oy, 0, height - 1);
+      if (!mask[sy * width + sx]) continue;
+
+      const distance = ox * ox + oy * oy;
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestX = sx;
+        bestY = sy;
+      }
+    }
+  }
+
+  return Number.isFinite(bestDistance) ? { x: bestX, y: bestY } : null;
+}
+
 function downloadBlob(blob: Blob, filename: string) {
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
@@ -79,6 +189,47 @@ function escapeXml(value: string) {
     const map: Record<string, string> = { "<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;", "'": "&apos;" };
     return map[char];
   });
+}
+
+function drawDot(context: CanvasRenderingContext2D, dot: Dot) {
+  if (dot.shape === "circle") {
+    context.beginPath();
+    context.arc(dot.x, dot.y, dot.size / 2, 0, Math.PI * 2);
+    context.fill();
+    return;
+  }
+
+  if (dot.shape === "square" || dot.shape === "micro" || dot.shape === "solid-square") {
+    context.fillRect(dot.x - dot.size / 2, dot.y - dot.size / 2, dot.size, dot.size);
+    return;
+  }
+
+  clusterCells(dot.shape).forEach(([ox, oy]) => {
+    const x = dot.x + ox * dot.size;
+    const y = dot.y + oy * dot.size;
+    context.fillRect(x - dot.size / 2, y - dot.size / 2, dot.size, dot.size);
+  });
+}
+
+function dotToSvg(dot: Dot) {
+  const opacity = dot.alpha.toFixed(3);
+  const color = escapeXml(dot.color);
+
+  if (dot.shape === "circle") {
+    return `<circle cx="${dot.x.toFixed(2)}" cy="${dot.y.toFixed(2)}" r="${(dot.size / 2).toFixed(2)}" fill="${color}" opacity="${opacity}"/>`;
+  }
+
+  if (dot.shape === "square" || dot.shape === "micro" || dot.shape === "solid-square") {
+    return `<rect x="${(dot.x - dot.size / 2).toFixed(2)}" y="${(dot.y - dot.size / 2).toFixed(2)}" width="${dot.size.toFixed(2)}" height="${dot.size.toFixed(2)}" fill="${color}" opacity="${opacity}"/>`;
+  }
+
+  return clusterCells(dot.shape)
+    .map(([ox, oy]) => {
+      const x = dot.x + ox * dot.size;
+      const y = dot.y + oy * dot.size;
+      return `<rect x="${(x - dot.size / 2).toFixed(2)}" y="${(y - dot.size / 2).toFixed(2)}" width="${dot.size.toFixed(2)}" height="${dot.size.toFixed(2)}" fill="${color}" opacity="${opacity}"/>`;
+    })
+    .join("");
 }
 
 function buildPixelArt(image: HTMLImageElement, settings: Settings) {
@@ -136,62 +287,181 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
     }
   }
 
+  const edgeStrength = new Float32Array(width * height);
+  const edgeAngle = new Float32Array(width * height);
+  let maxEdge = 1;
+
+  for (let y = 1; y < height - 1; y += 1) {
+    for (let x = 1; x < width - 1; x += 1) {
+      const tl = mask[(y - 1) * width + x - 1];
+      const tc = mask[(y - 1) * width + x];
+      const tr = mask[(y - 1) * width + x + 1];
+      const ml = mask[y * width + x - 1];
+      const mr = mask[y * width + x + 1];
+      const bl = mask[(y + 1) * width + x - 1];
+      const bc = mask[(y + 1) * width + x];
+      const br = mask[(y + 1) * width + x + 1];
+      const gx = -tl + tr - 2 * ml + 2 * mr - bl + br;
+      const gy = -tl - 2 * tc - tr + bl + 2 * bc + br;
+      const strength = Math.hypot(gx, gy);
+      const index = y * width + x;
+
+      edgeStrength[index] = strength;
+      edgeAngle[index] = Math.atan2(gy, gx);
+      maxEdge = Math.max(maxEdge, strength);
+    }
+  }
+
+  for (let index = 0; index < edgeStrength.length; index += 1) {
+    edgeStrength[index] /= maxEdge;
+  }
+
   const random = mulberry32(settings.seed);
-  const step = Math.round(18 - settings.density * 0.14);
-  const stride = clamp(step, 3, 16);
+  const baseStride = clamp(Math.round(17 - settings.density * 0.13), 4, 16);
+  const baseDensity = settings.density / 100;
   const noise = settings.noise / 100;
+  const maxDotSize = clamp(settings.dotSize, 1, 8);
+  const flowAngle = sampleRange(random, -0.35, 0.35) + (random() > 0.5 ? 0 : Math.PI);
+  const edgeDensityBoost = 3 + random() * 2;
   const dots: Dot[] = [];
 
-  for (let y = 0; y < height; y += stride) {
-    for (let x = 0; x < width; x += stride) {
-      const px = clamp(x + Math.floor(random() * stride), 0, width - 1);
-      const py = clamp(y + Math.floor(random() * stride), 0, height - 1);
-      if (!mask[py * width + px]) continue;
+  const pushDot = (x: number, y: number, size: number, alpha: number, shape: DotShape) => {
+    const cellSize = shape === "micro" ? clamp(size * 0.45, 1, 2.4) : clamp(size, 1, 8);
+    const finalSize = shape === "solid-square" ? clamp(size, 5, 16) : cellSize;
 
-      const radius = Math.max(2, Math.floor(stride * 1.6));
-      let edgeHits = 0;
-      let total = 0;
-      for (let oy = -radius; oy <= radius; oy += radius) {
-        for (let ox = -radius; ox <= radius; ox += radius) {
-          const sx = clamp(px + ox, 0, width - 1);
-          const sy = clamp(py + oy, 0, height - 1);
-          edgeHits += mask[sy * width + sx];
-          total += 1;
+    dots.push({
+      x,
+      y,
+      size: finalSize,
+      alpha,
+      shape,
+      color: settings.color,
+    });
+  };
+
+  const outwardAngle = (x: number, y: number, angle: number) => {
+    const forwardX = clamp(Math.round(x + Math.cos(angle) * 3), 0, width - 1);
+    const forwardY = clamp(Math.round(y + Math.sin(angle) * 3), 0, height - 1);
+    return mask[forwardY * width + forwardX] ? angle + Math.PI : angle;
+  };
+
+  for (let y = random() * baseStride; y < height; y += baseStride * sampleRange(random, 0.72, 1.34)) {
+    for (let x = random() * baseStride; x < width; x += baseStride * sampleRange(random, 0.68, 1.42)) {
+      const px = clamp(Math.round(x + sampleRange(random, -baseStride * 0.58, baseStride * 0.58)), 0, width - 1);
+      const py = clamp(Math.round(y + sampleRange(random, -baseStride * 0.58, baseStride * 0.58)), 0, height - 1);
+      const index = py * width + px;
+      const inMask = mask[index] === 1;
+      const edge = edgeStrength[index];
+      const nearEdge = edge > 0.08;
+      const scatterCandidate = !inMask && nearEdge && random() < noise * 0.18;
+
+      if (!inMask && !scatterCandidate) continue;
+
+      const regionChance = inMask
+        ? nearEdge
+          ? baseDensity * edgeDensityBoost
+          : baseDensity * 0.34
+        : baseDensity * 0.18;
+
+      if (random() > clamp(regionChance, 0.03, 0.96)) continue;
+
+      const normal = outwardAngle(px, py, edgeAngle[index]);
+      const localFlow = flowAngle + Math.sin((px + py) * 0.015 + settings.seed) * 0.32;
+      const flowDistance = Math.pow(random(), 1.5) * baseStride * (0.55 + noise * 2.8);
+      const normalDistance = scatterCandidate ? sampleRange(random, baseStride * 0.35, baseStride * 1.65) : sampleRange(random, -baseStride * 0.22, baseStride * 0.22);
+      const dotX = px + Math.cos(localFlow) * flowDistance + Math.cos(normal) * normalDistance;
+      const dotY = py + Math.sin(localFlow) * flowDistance + Math.sin(normal) * normalDistance;
+      const size = nearEdge
+        ? sampleRange(random, Math.max(3.2, maxDotSize * 0.62), maxDotSize)
+        : sampleRange(random, 1, Math.max(2.4, maxDotSize * 0.52));
+      const alpha = clamp(nearEdge ? sampleRange(random, 0.72, 1) : sampleRange(random, 0.28, 0.68), 0.18, 1);
+      const shape = pickParticleShape(random, nearEdge ? "edge" : "inside");
+
+      pushDot(dotX, dotY, size, alpha, shape);
+
+      if (nearEdge && inMask) {
+        const extraCount = 1 + Math.floor(random() * 3);
+        for (let i = 0; i < extraCount; i += 1) {
+          if (random() > baseDensity * 0.8) continue;
+          const echoDistance = sampleRange(random, 0, baseStride * 0.9);
+          const echoFlow = localFlow + sampleRange(random, -0.6, 0.6);
+          pushDot(
+            px + Math.cos(echoFlow) * echoDistance + sampleRange(random, -2.5, 2.5),
+            py + Math.sin(echoFlow) * echoDistance + sampleRange(random, -2.5, 2.5),
+            sampleRange(random, Math.max(2.8, maxDotSize * 0.48), maxDotSize),
+            sampleRange(random, 0.62, 0.96),
+            pickParticleShape(random, "edge"),
+          );
         }
       }
-      const edgeFactor = edgeHits > 0 && edgeHits < total ? 0.34 : 0;
-      const keepChance = clamp(settings.density / 100 + edgeFactor - noise * 0.32, 0.08, 0.98);
-      if (random() > keepChance) continue;
 
-      const drift = noise * stride * 5.5;
-      const direction = random() * Math.PI * 2;
-      const distance = Math.pow(random(), 1.8) * drift;
-      const burst = random() < noise * 0.18 ? 1 + random() * 3.8 : 1;
-      const sizeJitter = 0.58 + random() * 1.12;
-      const size = clamp(settings.dotSize * sizeJitter * (edgeFactor ? 0.9 : 1), 1.6, 34);
-      const alpha = clamp(0.56 + random() * 0.42 - noise * 0.12, 0.25, 0.98);
-      const shape: DotShape = random() > 0.58 ? "square" : "circle";
-
-      dots.push({
-        x: px + Math.cos(direction) * distance * burst,
-        y: py + Math.sin(direction) * distance * burst,
-        size,
-        alpha,
-        shape,
-        color: settings.color,
-      });
-
-      if (edgeFactor && random() < 0.45) {
-        dots.push({
-          x: px + (random() - 0.5) * stride,
-          y: py + (random() - 0.5) * stride,
-          size: clamp(size * (0.42 + random() * 0.35), 1.2, 16),
-          alpha: clamp(alpha + 0.08, 0.25, 1),
-          shape: random() > 0.5 ? "square" : "circle",
-          color: settings.color,
-        });
+      if (nearEdge && random() < 0.12 + noise * 0.12) {
+        pushDot(
+          px + sampleRange(random, -baseStride * 0.4, baseStride * 0.4),
+          py + sampleRange(random, -baseStride * 0.4, baseStride * 0.4),
+          sampleRange(random, 6, 14),
+          sampleRange(random, 0.78, 1),
+          "solid-square",
+        );
       }
     }
+  }
+
+  const edgeStride = Math.max(2, Math.round(baseStride * 0.42));
+  for (let y = random() * edgeStride; y < height; y += edgeStride * sampleRange(random, 0.82, 1.28)) {
+    for (let x = random() * edgeStride; x < width; x += edgeStride * sampleRange(random, 0.82, 1.28)) {
+      const px = clamp(Math.round(x + sampleRange(random, -edgeStride, edgeStride)), 0, width - 1);
+      const py = clamp(Math.round(y + sampleRange(random, -edgeStride, edgeStride)), 0, height - 1);
+      const index = py * width + px;
+      if (!mask[index] || edgeStrength[index] < 0.08 || random() > clamp(baseDensity * 0.92, 0.16, 0.94)) continue;
+
+      const tangent = edgeAngle[index] + Math.PI / 2 + sampleRange(random, -0.45, 0.45);
+      const normal = outwardAngle(px, py, edgeAngle[index]);
+      const repeats = 1 + Math.floor(random() * edgeDensityBoost * 0.62);
+
+      for (let i = 0; i < repeats; i += 1) {
+        const along = sampleRange(random, -baseStride * 0.7, baseStride * 0.7);
+        const lift = sampleRange(random, -baseStride * 0.18, baseStride * 0.32);
+        pushDot(
+          px + Math.cos(tangent) * along + Math.cos(normal) * lift,
+          py + Math.sin(tangent) * along + Math.sin(normal) * lift,
+          sampleRange(random, Math.max(3.2, maxDotSize * 0.62), maxDotSize),
+          sampleRange(random, 0.74, 1),
+          pickParticleShape(random, "edge"),
+        );
+      }
+
+      if (random() < noise * 0.22) {
+        pushDot(
+          px + Math.cos(normal) * sampleRange(random, baseStride * 0.85, baseStride * 2.2),
+          py + Math.sin(normal) * sampleRange(random, baseStride * 0.85, baseStride * 2.2),
+          sampleRange(random, 1, Math.max(2.5, maxDotSize * 0.45)),
+          sampleRange(random, 0.2, 0.5),
+          pickParticleShape(random, "scatter"),
+        );
+      }
+    }
+  }
+
+  const scatterCount = Math.round(dots.length * clamp(noise * 0.06, 0.015, 0.08));
+  for (let i = 0; i < scatterCount; i += 1) {
+    const source = dots[Math.floor(random() * dots.length)];
+    if (!source) break;
+
+    const sx = clamp(Math.round(source.x), 0, width - 1);
+    const sy = clamp(Math.round(source.y), 0, height - 1);
+    const nearest = findNearestForeground(mask, width, height, sx, sy, 8);
+    if (!nearest) continue;
+
+    const angle = Math.atan2(sy - nearest.y, sx - nearest.x) + sampleRange(random, -0.75, 0.75);
+    const distance = sampleRange(random, baseStride * 0.65, baseStride * 2.4);
+    pushDot(
+      nearest.x + Math.cos(angle) * distance,
+      nearest.y + Math.sin(angle) * distance,
+      sampleRange(random, 1, Math.max(2.5, maxDotSize * 0.55)),
+      sampleRange(random, 0.22, 0.56),
+      pickParticleShape(random, "scatter"),
+    );
   }
 
   return { dots, width, height };
@@ -228,13 +498,7 @@ function App() {
     nextDots.forEach((dot) => {
       context.globalAlpha = dot.alpha;
       context.fillStyle = dot.color;
-      if (dot.shape === "circle") {
-        context.beginPath();
-        context.arc(dot.x, dot.y, dot.size / 2, 0, Math.PI * 2);
-        context.fill();
-      } else {
-        context.fillRect(dot.x - dot.size / 2, dot.y - dot.size / 2, dot.size, dot.size);
-      }
+      drawDot(context, dot);
     });
     context.restore();
     context.globalAlpha = 1;
@@ -289,13 +553,7 @@ function App() {
   const exportSvg = () => {
     const width = artSize.width;
     const height = artSize.height;
-    const elements = dots.map((dot) => {
-      const opacity = dot.alpha.toFixed(3);
-      if (dot.shape === "circle") {
-        return `<circle cx="${dot.x.toFixed(2)}" cy="${dot.y.toFixed(2)}" r="${(dot.size / 2).toFixed(2)}" fill="${escapeXml(dot.color)}" opacity="${opacity}"/>`;
-      }
-      return `<rect x="${(dot.x - dot.size / 2).toFixed(2)}" y="${(dot.y - dot.size / 2).toFixed(2)}" width="${dot.size.toFixed(2)}" height="${dot.size.toFixed(2)}" fill="${escapeXml(dot.color)}" opacity="${opacity}"/>`;
-    });
+    const elements = dots.map(dotToSvg);
     const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><rect width="100%" height="100%" fill="${escapeXml(settings.background)}"/>${elements.join("")}</svg>`;
     downloadBlob(new Blob([svg], { type: "image/svg+xml;charset=utf-8" }), "blue-pixel-art.svg");
   };
@@ -331,7 +589,7 @@ function App() {
             <section className="space-y-5">
               <Slider label="Density" value={settings.density} min={8} max={100} onChange={(value) => updateSetting("density", value)} />
               <Slider label="Collapse / noise" value={settings.noise} min={0} max={100} suffix="%" onChange={(value) => updateSetting("noise", value)} />
-              <Slider label="Dot size" value={settings.dotSize} min={2} max={24} suffix="px" onChange={(value) => updateSetting("dotSize", value)} />
+              <Slider label="Dot size" value={settings.dotSize} min={1} max={8} suffix="px" onChange={(value) => updateSetting("dotSize", value)} />
             </section>
 
             <section className="grid grid-cols-2 gap-3">
