@@ -138,11 +138,15 @@ function clusterCells(shape: DotShape) {
     ];
   }
 
-  if (shape === "vertical-line") return [[0, -1], [0, 0], [0, 1]];
-  if (shape === "horizontal-line") return [[-1, 0], [0, 0], [1, 0]];
+  if (shape === "vertical-line") return [[0, -1.5], [0, -0.5], [0, 0.5], [0, 1.5]];
+  if (shape === "horizontal-line") return [[-1.5, 0], [-0.5, 0], [0.5, 0], [1.5, 0]];
   if (shape === "l-shape") return [[-1, -1], [-1, 0], [-1, 1], [0, 1], [1, 1]];
 
   return [];
+}
+
+function isClusterShape(shape: DotShape) {
+  return shape === "block-2" || shape === "block-3" || shape === "vertical-line" || shape === "horizontal-line" || shape === "l-shape";
 }
 
 function findNearestForeground(
@@ -321,13 +325,16 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
   const baseDensity = settings.density / 100;
   const noise = settings.noise / 100;
   const maxDotSize = clamp(settings.dotSize, 1, 8);
+  const posterGrid = clamp(Math.round(maxDotSize * 0.86), 4, 7);
   const flowAngle = sampleRange(random, -0.35, 0.35) + (random() > 0.5 ? 0 : Math.PI);
   const edgeDensityBoost = 3 + random() * 2;
   const dots: Dot[] = [];
 
-  const pushDot = (x: number, y: number, size: number, alpha: number, shape: DotShape) => {
+  const snapToPosterGrid = (value: number) => Math.round(value / posterGrid) * posterGrid;
+
+  const pushRawDot = (x: number, y: number, size: number, alpha: number, shape: DotShape, color = settings.color) => {
     const cellSize = shape === "micro" ? clamp(size * 0.45, 1, 2.4) : clamp(size, 1, 8);
-    const finalSize = shape === "solid-square" ? clamp(size, 5, 16) : cellSize;
+    const finalSize = shape === "solid-square" ? clamp(size, 8, 28) : cellSize;
 
     dots.push({
       x,
@@ -335,8 +342,35 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
       size: finalSize,
       alpha,
       shape,
-      color: settings.color,
+      color,
     });
+  };
+
+  const pushCutouts = (x: number, y: number, size: number, shape: DotShape) => {
+    if (random() > 0.66 || (!isClusterShape(shape) && shape !== "solid-square")) return;
+
+    const holes = shape === "solid-square" ? 1 + Math.floor(random() * 3) : 1;
+    for (let i = 0; i < holes; i += 1) {
+      const range = shape === "solid-square" ? size * 0.32 : size * 0.8;
+      pushRawDot(
+        snapToPosterGrid(x + sampleRange(random, -range, range)),
+        snapToPosterGrid(y + sampleRange(random, -range, range)),
+        sampleRange(random, Math.max(2.2, size * 0.22), Math.max(3, size * 0.42)),
+        1,
+        random() > 0.12 ? "circle" : "square",
+        settings.background,
+      );
+    }
+  };
+
+  const pushDot = (x: number, y: number, size: number, alpha: number, shape: DotShape) => {
+    const shouldSnap = shape !== "circle" || size > 2.6;
+    const dotX = shouldSnap ? snapToPosterGrid(x) : x;
+    const dotY = shouldSnap ? snapToPosterGrid(y) : y;
+    const dotSize = shape === "solid-square" ? sampleRange(random, Math.max(10, size), Math.max(14, size * 1.7)) : size;
+
+    pushRawDot(dotX, dotY, dotSize, alpha, shape);
+    pushCutouts(dotX, dotY, dotSize, shape);
   };
 
   const outwardAngle = (x: number, y: number, angle: number) => {
@@ -438,6 +472,39 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
           sampleRange(random, 1, Math.max(2.5, maxDotSize * 0.45)),
           sampleRange(random, 0.2, 0.5),
           pickParticleShape(random, "scatter"),
+        );
+      }
+    }
+  }
+
+  const structuralStride = Math.max(10, baseStride * 1.7);
+  for (let y = random() * structuralStride; y < height; y += structuralStride * sampleRange(random, 0.8, 1.35)) {
+    for (let x = random() * structuralStride; x < width; x += structuralStride * sampleRange(random, 0.8, 1.35)) {
+      const px = clamp(Math.round(x + sampleRange(random, -baseStride, baseStride)), 0, width - 1);
+      const py = clamp(Math.round(y + sampleRange(random, -baseStride, baseStride)), 0, height - 1);
+      const index = py * width + px;
+      if (!mask[index] || edgeStrength[index] < 0.05 || random() > clamp(baseDensity * 0.38, 0.08, 0.42)) continue;
+
+      const tangent = edgeAngle[index] + Math.PI / 2;
+      const axis = Math.abs(Math.cos(tangent)) > Math.abs(Math.sin(tangent)) ? 0 : Math.PI / 2;
+      const runLength = 2 + Math.floor(random() * 4);
+      const blockSize = sampleRange(random, 9, 18);
+      const start = -(runLength - 1) / 2;
+
+      for (let i = 0; i < runLength; i += 1) {
+        const offset = (start + i) * blockSize * sampleRange(random, 0.75, 1.05);
+        const bx = px + Math.cos(axis) * offset + sampleRange(random, -2, 2);
+        const by = py + Math.sin(axis) * offset + sampleRange(random, -2, 2);
+        const sx = clamp(Math.round(bx), 0, width - 1);
+        const sy = clamp(Math.round(by), 0, height - 1);
+        if (!mask[sy * width + sx] && random() > noise * 0.22) continue;
+
+        pushDot(
+          bx,
+          by,
+          blockSize * sampleRange(random, 0.85, 1.35),
+          sampleRange(random, 0.84, 1),
+          random() < 0.68 ? "solid-square" : axis === 0 ? "horizontal-line" : "vertical-line",
         );
       }
     }
