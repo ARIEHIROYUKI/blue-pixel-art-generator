@@ -45,7 +45,7 @@ type SourceImage = {
 const CANVAS_WIDTH = 1200;
 const CANVAS_HEIGHT = 880;
 const MAX_SOURCE_SIDE = 920;
-const APP_VERSION = "v2026.05.27-grid-symbolic-3";
+const APP_VERSION = "v2026.05.27-grid-matrix-4";
 const DEFAULT_SETTINGS: Settings = {
   density: 52,
   noise: 24,
@@ -446,340 +446,162 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
 
   mask = preprocessSilhouette(mask, width, height);
 
-  const edgeStrength = new Float32Array(width * height);
-  const edgeAngle = new Float32Array(width * height);
-  let maxEdge = 1;
-
-  for (let y = 1; y < height - 1; y += 1) {
-    for (let x = 1; x < width - 1; x += 1) {
-      const tl = mask[(y - 1) * width + x - 1];
-      const tc = mask[(y - 1) * width + x];
-      const tr = mask[(y - 1) * width + x + 1];
-      const ml = mask[y * width + x - 1];
-      const mr = mask[y * width + x + 1];
-      const bl = mask[(y + 1) * width + x - 1];
-      const bc = mask[(y + 1) * width + x];
-      const br = mask[(y + 1) * width + x + 1];
-      const gx = -tl + tr - 2 * ml + 2 * mr - bl + br;
-      const gy = -tl - 2 * tc - tr + bl + 2 * bc + br;
-      const strength = Math.hypot(gx, gy);
-      const index = y * width + x;
-
-      edgeStrength[index] = strength;
-      edgeAngle[index] = Math.atan2(gy, gx);
-      maxEdge = Math.max(maxEdge, strength);
-    }
-  }
-
-  for (let index = 0; index < edgeStrength.length; index += 1) {
-    edgeStrength[index] /= maxEdge;
-  }
-
   const random = mulberry32(settings.seed);
-  const baseStride = clamp(Math.round(17 - settings.density * 0.13), 4, 16);
   const baseDensity = settings.density / 100;
   const noise = settings.noise / 100;
-  const maxDotSize = clamp(settings.dotSize, 1, 8);
-  const gridSize = clamp(settings.gridSize, 4, 12);
-  const posterGrid = settings.gridSnapping ? gridSize : clamp(Math.round(maxDotSize * 0.86), 4, 7);
-  const sampleStep = posterGrid * Math.max(1, Math.round(baseStride / posterGrid));
-  const edgeStep = posterGrid * Math.max(1, Math.round(baseStride * 0.42 / posterGrid));
-  const jointStep = posterGrid * Math.max(1, Math.round(baseStride * 0.72 / posterGrid));
-  const flowAngle = sampleRange(random, -0.35, 0.35) + (random() > 0.5 ? 0 : Math.PI);
-  const edgeDensityBoost = 3 + random() * 2;
-  const jointStrength = new Float32Array(width * height);
-  const bodyMass = new Float32Array(width * height);
-  const dots: Dot[] = [];
+  const gridSize = settings.gridSnapping ? clamp(settings.gridSize, 4, 12) : clamp(settings.dotSize, 4, 12);
+  const gridWidth = Math.max(1, Math.floor(width / gridSize));
+  const gridHeight = Math.max(1, Math.floor(height / gridSize));
+  type GridKind = "empty" | "square" | "circle" | "hole-square" | "hole-circle";
+  const grid = new Array<GridKind>(gridWidth * gridHeight).fill("empty");
+  const cellMask = new Uint8Array(gridWidth * gridHeight);
+  const cellEdge = new Uint8Array(gridWidth * gridHeight);
+  const cellBody = new Float32Array(gridWidth * gridHeight);
+  const cellJoint = new Float32Array(gridWidth * gridHeight);
+  const holeQueue: Array<{ cx: number; cy: number; kind: "hole-square" | "hole-circle" }> = [];
 
-  const jointRadius = Math.max(6, Math.round(baseStride * 1.45));
-  for (let y = jointRadius; y < height - jointRadius; y += 1) {
-    for (let x = jointRadius; x < width - jointRadius; x += 1) {
-      const index = y * width + x;
-      if (!mask[index] || edgeStrength[index] > 0.08) continue;
-
-      let edgeCount = 0;
-      let fillCount = 0;
-      let samples = 0;
-      for (let oy = -jointRadius; oy <= jointRadius; oy += 3) {
-        for (let ox = -jointRadius; ox <= jointRadius; ox += 3) {
-          const sampleIndex = (y + oy) * width + x + ox;
-          fillCount += mask[sampleIndex];
-          edgeCount += edgeStrength[sampleIndex] > 0.08 ? 1 : 0;
-          samples += 1;
+  const cellIndex = (cx: number, cy: number) => cy * gridWidth + cx;
+  const inGrid = (cx: number, cy: number) => cx >= 0 && cx < gridWidth && cy >= 0 && cy < gridHeight;
+  const pixelX = (cx: number) => Math.round(cx * gridSize + gridSize / 2);
+  const pixelY = (cy: number) => Math.round(cy * gridSize + gridSize / 2);
+  const maskAtCell = (cx: number, cy: number) => {
+    const px = clamp(pixelX(cx), 0, width - 1);
+    const py = clamp(pixelY(cy), 0, height - 1);
+    return mask[py * width + px];
+  };
+  const setCell = (cx: number, cy: number, kind: GridKind) => {
+    if (!inGrid(cx, cy)) return;
+    const index = cellIndex(cx, cy);
+    if (grid[index].startsWith("hole")) return;
+    grid[index] = kind;
+  };
+  const queueHole = (cx: number, cy: number) => {
+    if (!inGrid(cx, cy)) return;
+    holeQueue.push({ cx, cy, kind: random() > 0.2 ? "hole-circle" : "hole-square" });
+  };
+  const fillBlock = (cx: number, cy: number, cellsWide: number, cellsHigh: number) => {
+    const startX = cx - Math.floor(cellsWide / 2);
+    const startY = cy - Math.floor(cellsHigh / 2);
+    for (let y = 0; y < cellsHigh; y += 1) {
+      for (let x = 0; x < cellsWide; x += 1) {
+        const gx = startX + x;
+        const gy = startY + y;
+        if (inGrid(gx, gy) && (cellMask[cellIndex(gx, gy)] || random() < noise * 0.18)) {
+          setCell(gx, gy, "square");
         }
       }
-
-      const fillRatio = fillCount / Math.max(samples, 1);
-      const edgeRatio = edgeCount / Math.max(samples, 1);
-      bodyMass[index] = fillRatio;
-      jointStrength[index] = fillRatio > 0.18 && fillRatio < 0.72 ? clamp(edgeRatio * 3.4, 0, 1) : 0;
     }
-  }
 
-  const snapToPosterGrid = (value: number) => {
-    if (!settings.gridSnapping) return value;
-    return clamp(Math.round((value - posterGrid / 2) / posterGrid) * posterGrid + posterGrid / 2, posterGrid / 2, Math.max(posterGrid / 2, width - posterGrid / 2));
-  };
-  const snapYToPosterGrid = (value: number) => {
-    if (!settings.gridSnapping) return value;
-    return clamp(Math.round((value - posterGrid / 2) / posterGrid) * posterGrid + posterGrid / 2, posterGrid / 2, Math.max(posterGrid / 2, height - posterGrid / 2));
-  };
-  const quantizeSize = (size: number, minCells = 1, maxCells = 6) => {
-    if (!settings.gridSnapping) return size;
-    return clamp(Math.round(size / posterGrid), minCells, maxCells) * posterGrid;
-  };
-
-  const pushRawDot = (x: number, y: number, size: number, alpha: number, shape: DotShape, color = settings.color) => {
-    const cellSize = shape === "micro" ? quantizeSize(size * 0.45, 1, 1) : quantizeSize(size, 1, 2);
-    const finalSize =
-      shape === "solid-square" || shape === "solid-vertical-rect" || shape === "solid-horizontal-rect"
-        ? quantizeSize(size, 2, 6)
-        : cellSize;
-
-    dots.push({
-      x,
-      y,
-      size: finalSize,
-      alpha: 1,
-      shape,
-      color,
-    });
-  };
-
-  const pushCutouts = (x: number, y: number, size: number, shape: DotShape) => {
-    if (random() > 0.84 && !shape.startsWith("solid-")) return;
-    if (!isClusterShape(shape) && !shape.startsWith("solid-")) return;
-
-    const holes = shape.startsWith("solid-") ? 2 + Math.floor(random() * 4) : 1 + Math.floor(random() * 2);
+    const holes = Math.max(1, Math.round((cellsWide * cellsHigh) * 0.18));
     for (let i = 0; i < holes; i += 1) {
-      const rect = rectSize({ x, y, size, alpha: 1, shape, color: settings.color });
-      const rangeX = shape.startsWith("solid-") ? rect.width * 0.36 : size * 0.8;
-      const rangeY = shape.startsWith("solid-") ? rect.height * 0.36 : size * 0.8;
-      pushRawDot(
-        snapToPosterGrid(x + sampleRange(random, -rangeX, rangeX)),
-        snapYToPosterGrid(y + sampleRange(random, -rangeY, rangeY)),
-        sampleRange(random, Math.max(2.2, size * 0.22), Math.max(3, size * 0.42)),
-        1,
-        random() > 0.12 ? "circle" : "square",
-        settings.background,
-      );
+      queueHole(startX + Math.floor(random() * cellsWide), startY + Math.floor(random() * cellsHigh));
     }
   };
 
-  const pushDot = (x: number, y: number, size: number, alpha: number, shape: DotShape) => {
-    const shouldSnap = settings.gridSnapping || shape !== "circle" || size > 2.6;
-    const dotX = shouldSnap ? snapToPosterGrid(x) : x;
-    const dotY = shouldSnap ? snapYToPosterGrid(y) : y;
-    const dotSize = shape.startsWith("solid-") ? sampleRange(random, Math.max(11, size), Math.max(16, size * 1.8)) : size;
+  for (let cy = 0; cy < gridHeight; cy += 1) {
+    for (let cx = 0; cx < gridWidth; cx += 1) {
+      const index = cellIndex(cx, cy);
+      cellMask[index] = maskAtCell(cx, cy);
+    }
+  }
 
-    pushRawDot(dotX, dotY, dotSize, 1, shape);
-    pushCutouts(dotX, dotY, dotSize, shape);
-  };
+  for (let cy = 0; cy < gridHeight; cy += 1) {
+    for (let cx = 0; cx < gridWidth; cx += 1) {
+      const index = cellIndex(cx, cy);
+      if (!cellMask[index]) continue;
 
-  const outwardAngle = (x: number, y: number, angle: number) => {
-    const forwardX = clamp(Math.round(x + Math.cos(angle) * 3), 0, width - 1);
-    const forwardY = clamp(Math.round(y + Math.sin(angle) * 3), 0, height - 1);
-    return mask[forwardY * width + forwardX] ? angle + Math.PI : angle;
-  };
-
-  for (let y = posterGrid / 2; y < height; y += sampleStep) {
-    for (let x = posterGrid / 2; x < width; x += sampleStep) {
-      const px = clamp(Math.round(x), 0, width - 1);
-      const py = clamp(Math.round(y), 0, height - 1);
-      const index = py * width + px;
-      const inMask = mask[index] === 1;
-      const edge = edgeStrength[index];
-      const nearEdge = edge > 0.08;
-      const joint = jointStrength[index] > 0.28;
-      const scatterCandidate = !inMask && nearEdge && random() < noise * 0.18;
-
-      if (!inMask && !scatterCandidate) continue;
-
-      const regionChance = inMask
-        ? nearEdge
-          ? baseDensity * edgeDensityBoost
-          : joint
-            ? baseDensity * 1.22
-            : baseDensity * 0.08
-        : baseDensity * 0.12;
-
-      if (random() > clamp(regionChance, 0.03, 0.96)) continue;
-
-      const normal = outwardAngle(px, py, edgeAngle[index]);
-      const localFlow = flowAngle + Math.sin((px + py) * 0.015 + settings.seed) * 0.32;
-      const flowCells = Math.round((Math.pow(random(), 1.5) * baseStride * (0.55 + noise * 2.8)) / posterGrid);
-      const normalCells = scatterCandidate ? 1 + Math.floor(random() * 3) : 0;
-      const dotX = px + Math.round(Math.cos(localFlow) * flowCells + Math.cos(normal) * normalCells) * posterGrid;
-      const dotY = py + Math.round(Math.sin(localFlow) * flowCells + Math.sin(normal) * normalCells) * posterGrid;
-      const size = nearEdge
-        ? sampleRange(random, 1.2, Math.max(3.2, maxDotSize * 0.5))
-        : joint
-          ? sampleRange(random, 2.2, Math.max(4.2, maxDotSize * 0.62))
-          : sampleRange(random, 1, Math.max(2.1, maxDotSize * 0.34));
-      const shape = nearEdge
-        ? pickSmallDotShape(random)
-        : joint
-          ? pickParticleShape(random, "edge")
-          : pickSmallDotShape(random);
-
-      pushDot(dotX, dotY, size, 1, shape);
-
-      if (nearEdge && inMask) {
-        const extraCount = 1 + Math.floor(random() * 3);
-        for (let i = 0; i < extraCount; i += 1) {
-          if (random() > baseDensity * 0.8) continue;
-          const echoDistance = sampleRange(random, 0, baseStride * 0.9);
-          const echoFlow = localFlow + sampleRange(random, -0.6, 0.6);
-          const echoCells = Math.round(echoDistance / posterGrid);
-          pushDot(
-            px + Math.round(Math.cos(echoFlow) * echoCells) * posterGrid,
-            py + Math.round(Math.sin(echoFlow) * echoCells) * posterGrid,
-            sampleRange(random, 1.2, Math.max(3.2, maxDotSize * 0.44)),
-            1,
-            pickSmallDotShape(random),
-          );
+      let filled = 0;
+      let total = 0;
+      let edgeNeighbors = 0;
+      for (let oy = -2; oy <= 2; oy += 1) {
+        for (let ox = -2; ox <= 2; ox += 1) {
+          const nx = cx + ox;
+          const ny = cy + oy;
+          if (!inGrid(nx, ny)) continue;
+          const neighbor = cellMask[cellIndex(nx, ny)];
+          filled += neighbor;
+          total += 1;
+          if (Math.abs(ox) <= 1 && Math.abs(oy) <= 1 && !neighbor) edgeNeighbors += 1;
         }
       }
 
-      if (nearEdge && random() < 0.12 + noise * 0.12) {
-        pushDot(
-          px + sampleGridOffset(random, 1, posterGrid),
-          py + sampleGridOffset(random, 1, posterGrid),
-          sampleRange(random, 6, 14),
-          sampleRange(random, 0.78, 1),
-          "solid-square",
-        );
+      const fillRatio = filled / Math.max(total, 1);
+      cellBody[index] = fillRatio;
+      cellEdge[index] = edgeNeighbors > 0 ? 1 : 0;
+      cellJoint[index] = fillRatio > 0.2 && fillRatio < 0.74 && edgeNeighbors >= 2 ? clamp(edgeNeighbors / 5, 0, 1) : 0;
+    }
+  }
+
+  for (let cy = 0; cy < gridHeight; cy += 1) {
+    for (let cx = 0; cx < gridWidth; cx += 1) {
+      const index = cellIndex(cx, cy);
+      if (!cellMask[index]) continue;
+
+      if (cellEdge[index] && random() < clamp(baseDensity * 1.6, 0.18, 0.95)) {
+        setCell(cx, cy, random() > 0.35 ? "circle" : "square");
+        if (random() < baseDensity * 0.55) {
+          setCell(cx + sampleGridOffset(random, 1, 1), cy + sampleGridOffset(random, 1, 1), random() > 0.5 ? "circle" : "square");
+        }
+      }
+
+      if (cellJoint[index] > 0.3 && random() < clamp(baseDensity * 1.15, 0.18, 0.82)) {
+        const count = 2 + Math.floor(random() * 4);
+        for (let i = 0; i < count; i += 1) {
+          setCell(cx + sampleGridOffset(random, 2, 1), cy + sampleGridOffset(random, 2, 1), random() > 0.45 ? "circle" : "square");
+        }
       }
     }
   }
 
-  for (let y = posterGrid / 2; y < height; y += edgeStep) {
-    for (let x = posterGrid / 2; x < width; x += edgeStep) {
-      const px = clamp(Math.round(x), 0, width - 1);
-      const py = clamp(Math.round(y), 0, height - 1);
-      const index = py * width + px;
-      if (!mask[index] || edgeStrength[index] < 0.08 || random() > clamp(baseDensity * 0.92, 0.16, 0.94)) continue;
+  const blockStep = Math.max(2, Math.round(22 / gridSize));
+  for (let cy = 0; cy < gridHeight; cy += blockStep) {
+    for (let cx = 0; cx < gridWidth; cx += blockStep) {
+      const index = cellIndex(cx, cy);
+      if (!cellMask[index] || cellBody[index] < 0.42 || random() > clamp(baseDensity * 0.72, 0.12, 0.72)) continue;
 
-      const tangent = edgeAngle[index] + Math.PI / 2 + sampleRange(random, -0.45, 0.45);
-      const normal = outwardAngle(px, py, edgeAngle[index]);
-      const repeats = 1 + Math.floor(random() * edgeDensityBoost * 0.62);
-
-      for (let i = 0; i < repeats; i += 1) {
-        const along = sampleGridOffset(random, Math.round((baseStride * 0.7) / posterGrid), posterGrid);
-        const lift = sampleGridOffset(random, 1, posterGrid);
-        pushDot(
-          px + Math.round((Math.cos(tangent) * along + Math.cos(normal) * lift) / posterGrid) * posterGrid,
-          py + Math.round((Math.sin(tangent) * along + Math.sin(normal) * lift) / posterGrid) * posterGrid,
-          sampleRange(random, 1.1, Math.max(3.4, maxDotSize * 0.42)),
-          1,
-          pickSmallDotShape(random),
-        );
-      }
-
-      if (random() < noise * 0.22) {
-        const scatterCells = 1 + Math.floor(random() * 4);
-        pushDot(
-          px + Math.round(Math.cos(normal) * scatterCells) * posterGrid,
-          py + Math.round(Math.sin(normal) * scatterCells) * posterGrid,
-          sampleRange(random, 1, Math.max(2.5, maxDotSize * 0.45)),
-          sampleRange(random, 0.2, 0.5),
-          pickParticleShape(random, "scatter"),
-        );
-      }
+      const vertical = random() > 0.42;
+      const cellsWide = vertical ? 1 + Math.floor(random() * 2) : 3 + Math.floor(random() * 4);
+      const cellsHigh = vertical ? 3 + Math.floor(random() * 5) : 1 + Math.floor(random() * 2);
+      fillBlock(cx, cy, cellsWide, cellsHigh);
     }
   }
 
-  for (let y = posterGrid / 2; y < height; y += jointStep) {
-    for (let x = posterGrid / 2; x < width; x += jointStep) {
-      const px = clamp(Math.round(x), 0, width - 1);
-      const py = clamp(Math.round(y), 0, height - 1);
-      const index = py * width + px;
-      if (!mask[index] || jointStrength[index] < 0.3 || random() > clamp(baseDensity * 0.82, 0.18, 0.78)) continue;
+  const scatterAttempts = Math.round(gridWidth * gridHeight * clamp(noise * 0.006, 0.002, 0.012));
+  for (let i = 0; i < scatterAttempts; i += 1) {
+    const cx = Math.floor(random() * gridWidth);
+    const cy = Math.floor(random() * gridHeight);
+    const index = cellIndex(cx, cy);
+    if (!cellEdge[index] || random() > baseDensity) continue;
 
-      const count = 2 + Math.floor(random() * 4);
-      for (let i = 0; i < count; i += 1) {
-        pushDot(
-          px + sampleGridOffset(random, 2, posterGrid),
-          py + sampleGridOffset(random, 2, posterGrid),
-          sampleRange(random, 2, Math.max(4, maxDotSize * 0.68)),
-          1,
-          random() < 0.66 ? pickSmallDotShape(random) : pickMediumClusterShape(random),
-        );
-      }
+    const dx = sampleGridOffset(random, 3, 1);
+    const dy = sampleGridOffset(random, 3, 1);
+    const tx = cx + dx;
+    const ty = cy + dy;
+    if (inGrid(tx, ty) && !cellMask[cellIndex(tx, ty)]) {
+      setCell(tx, ty, random() > 0.4 ? "circle" : "square");
     }
   }
 
-  const structuralStep = posterGrid * Math.max(2, Math.round((baseStride * 1.7) / posterGrid));
-  for (let y = posterGrid / 2; y < height; y += structuralStep) {
-    for (let x = posterGrid / 2; x < width; x += structuralStep) {
-      const px = clamp(Math.round(x), 0, width - 1);
-      const py = clamp(Math.round(y), 0, height - 1);
-      const index = py * width + px;
-      if (!mask[index]) continue;
-
-      const contour = edgeStrength[index] > 0.05;
-      const bulkyPart = bodyMass[index] > 0.42;
-      const keepStructure = contour ? baseDensity * 0.24 : bulkyPart ? baseDensity * 0.72 : baseDensity * 0.1;
-      if (random() > clamp(keepStructure, 0.1, 0.68)) continue;
-
-      const tangent = edgeAngle[index] + Math.PI / 2;
-      const axis = contour
-        ? Math.abs(Math.cos(tangent)) > Math.abs(Math.sin(tangent))
-          ? 0
-          : Math.PI / 2
-        : random() > 0.42
-          ? Math.PI / 2
-          : 0;
-      const runLength = 2 + Math.floor(random() * 4);
-      const blockSize = sampleRange(random, bulkyPart ? 14 : 8, bulkyPart ? 28 : 14);
-      const start = -(runLength - 1) / 2;
-
-      for (let i = 0; i < runLength; i += 1) {
-        const offsetCells = Math.round(((start + i) * blockSize) / posterGrid);
-        const bx = px + Math.cos(axis) * offsetCells * posterGrid;
-        const by = py + Math.sin(axis) * offsetCells * posterGrid;
-        const sx = clamp(Math.round(bx), 0, width - 1);
-        const sy = clamp(Math.round(by), 0, height - 1);
-        if (!mask[sy * width + sx] && random() > noise * 0.22) continue;
-
-        pushDot(
-          bx,
-          by,
-          blockSize * sampleRange(random, 0.85, 1.35),
-          1,
-          bulkyPart && random() < 0.82
-            ? axis === 0
-              ? "solid-horizontal-rect"
-              : "solid-vertical-rect"
-            : random() < 0.36
-              ? "solid-square"
-              : axis === 0
-                ? "horizontal-line"
-                : "vertical-line",
-        );
-      }
+  holeQueue.forEach(({ cx, cy, kind }) => {
+    if (inGrid(cx, cy) && grid[cellIndex(cx, cy)] !== "empty") {
+      grid[cellIndex(cx, cy)] = kind;
     }
-  }
+  });
 
-  const scatterCount = Math.round(dots.length * clamp(noise * 0.06, 0.015, 0.08));
-  for (let i = 0; i < scatterCount; i += 1) {
-    const source = dots[Math.floor(random() * dots.length)];
-    if (!source) break;
-
-    const sx = clamp(Math.round(source.x), 0, width - 1);
-    const sy = clamp(Math.round(source.y), 0, height - 1);
-    const nearest = findNearestForeground(mask, width, height, sx, sy, 8);
-    if (!nearest) continue;
-
-    const angle = Math.atan2(sy - nearest.y, sx - nearest.x);
-    const distanceCells = 1 + Math.floor(random() * Math.max(2, Math.round((baseStride * 2.4) / posterGrid)));
-    pushDot(
-      nearest.x + Math.round(Math.cos(angle) * distanceCells) * posterGrid,
-      nearest.y + Math.round(Math.sin(angle) * distanceCells) * posterGrid,
-      sampleRange(random, 1, Math.max(2.5, maxDotSize * 0.55)),
-      sampleRange(random, 0.22, 0.56),
-      pickParticleShape(random, "scatter"),
-    );
+  const dots: Dot[] = [];
+  for (let cy = 0; cy < gridHeight; cy += 1) {
+    for (let cx = 0; cx < gridWidth; cx += 1) {
+      const kind = grid[cellIndex(cx, cy)];
+      if (kind === "empty") continue;
+      dots.push({
+        x: pixelX(cx),
+        y: pixelY(cy),
+        size: gridSize,
+        alpha: 1,
+        shape: kind === "circle" || kind === "hole-circle" ? "circle" : "square",
+        color: kind.startsWith("hole") ? settings.background : settings.color,
+      });
+    }
   }
 
   return { dots, width, height };
