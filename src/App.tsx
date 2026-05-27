@@ -13,7 +13,9 @@ type DotShape =
   | "vertical-line"
   | "horizontal-line"
   | "l-shape"
-  | "solid-square";
+  | "solid-square"
+  | "solid-vertical-rect"
+  | "solid-horizontal-rect";
 
 type Dot = {
   x: number;
@@ -45,8 +47,8 @@ const DEFAULT_SETTINGS: Settings = {
   density: 52,
   noise: 24,
   dotSize: 8,
-  color: "#1463ff",
-  background: "#f8fafc",
+  color: "#0B8FE8",
+  background: "#F3F4F1",
   seed: 24891,
 };
 
@@ -98,19 +100,20 @@ function pickParticleShape(random: () => number, region: "edge" | "inside" | "sc
   const roll = random();
 
   if (region === "inside") {
-    if (roll < 0.9) return pickSmallDotShape(random);
-    if (roll < 0.99) return pickMediumClusterShape(random);
-    return "solid-square";
+    if (roll < 0.82) return pickSmallDotShape(random);
+    if (roll < 0.94) return pickMediumClusterShape(random);
+    return random() > 0.5 ? "solid-vertical-rect" : "solid-horizontal-rect";
   }
 
   if (region === "edge") {
-    if (roll < 0.46) return pickSmallDotShape(random);
-    if (roll < 0.82) return pickMediumClusterShape(random);
-    return "solid-square";
+    if (roll < 0.42) return pickSmallDotShape(random);
+    if (roll < 0.72) return pickMediumClusterShape(random);
+    if (roll < 0.84) return "solid-square";
+    return random() > 0.52 ? "solid-vertical-rect" : "solid-horizontal-rect";
   }
 
-  if (roll < 0.7) return pickSmallDotShape(random);
-  if (roll < 0.9) return pickMediumClusterShape(random);
+  if (roll < 0.82) return pickSmallDotShape(random);
+  if (roll < 0.94) return pickMediumClusterShape(random);
   return "solid-square";
 }
 
@@ -147,6 +150,12 @@ function clusterCells(shape: DotShape) {
 
 function isClusterShape(shape: DotShape) {
   return shape === "block-2" || shape === "block-3" || shape === "vertical-line" || shape === "horizontal-line" || shape === "l-shape";
+}
+
+function rectSize(dot: Dot) {
+  if (dot.shape === "solid-vertical-rect") return { width: dot.size, height: dot.size * 2.9 };
+  if (dot.shape === "solid-horizontal-rect") return { width: dot.size * 2.9, height: dot.size };
+  return { width: dot.size, height: dot.size };
 }
 
 function findNearestForeground(
@@ -203,8 +212,9 @@ function drawDot(context: CanvasRenderingContext2D, dot: Dot) {
     return;
   }
 
-  if (dot.shape === "square" || dot.shape === "micro" || dot.shape === "solid-square") {
-    context.fillRect(dot.x - dot.size / 2, dot.y - dot.size / 2, dot.size, dot.size);
+  if (dot.shape === "square" || dot.shape === "micro" || dot.shape === "solid-square" || dot.shape === "solid-vertical-rect" || dot.shape === "solid-horizontal-rect") {
+    const { width, height } = rectSize(dot);
+    context.fillRect(dot.x - width / 2, dot.y - height / 2, width, height);
     return;
   }
 
@@ -216,22 +226,22 @@ function drawDot(context: CanvasRenderingContext2D, dot: Dot) {
 }
 
 function dotToSvg(dot: Dot) {
-  const opacity = dot.alpha.toFixed(3);
   const color = escapeXml(dot.color);
 
   if (dot.shape === "circle") {
-    return `<circle cx="${dot.x.toFixed(2)}" cy="${dot.y.toFixed(2)}" r="${(dot.size / 2).toFixed(2)}" fill="${color}" opacity="${opacity}"/>`;
+    return `<circle cx="${dot.x.toFixed(2)}" cy="${dot.y.toFixed(2)}" r="${(dot.size / 2).toFixed(2)}" fill="${color}"/>`;
   }
 
-  if (dot.shape === "square" || dot.shape === "micro" || dot.shape === "solid-square") {
-    return `<rect x="${(dot.x - dot.size / 2).toFixed(2)}" y="${(dot.y - dot.size / 2).toFixed(2)}" width="${dot.size.toFixed(2)}" height="${dot.size.toFixed(2)}" fill="${color}" opacity="${opacity}"/>`;
+  if (dot.shape === "square" || dot.shape === "micro" || dot.shape === "solid-square" || dot.shape === "solid-vertical-rect" || dot.shape === "solid-horizontal-rect") {
+    const { width, height } = rectSize(dot);
+    return `<rect x="${(dot.x - width / 2).toFixed(2)}" y="${(dot.y - height / 2).toFixed(2)}" width="${width.toFixed(2)}" height="${height.toFixed(2)}" fill="${color}"/>`;
   }
 
   return clusterCells(dot.shape)
     .map(([ox, oy]) => {
       const x = dot.x + ox * dot.size;
       const y = dot.y + oy * dot.size;
-      return `<rect x="${(x - dot.size / 2).toFixed(2)}" y="${(y - dot.size / 2).toFixed(2)}" width="${dot.size.toFixed(2)}" height="${dot.size.toFixed(2)}" fill="${color}" opacity="${opacity}"/>`;
+      return `<rect x="${(x - dot.size / 2).toFixed(2)}" y="${(y - dot.size / 2).toFixed(2)}" width="${dot.size.toFixed(2)}" height="${dot.size.toFixed(2)}" fill="${color}"/>`;
     })
     .join("");
 }
@@ -334,27 +344,33 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
 
   const pushRawDot = (x: number, y: number, size: number, alpha: number, shape: DotShape, color = settings.color) => {
     const cellSize = shape === "micro" ? clamp(size * 0.45, 1, 2.4) : clamp(size, 1, 8);
-    const finalSize = shape === "solid-square" ? clamp(size, 8, 28) : cellSize;
+    const finalSize =
+      shape === "solid-square" || shape === "solid-vertical-rect" || shape === "solid-horizontal-rect"
+        ? clamp(size, 8, 32)
+        : cellSize;
 
     dots.push({
       x,
       y,
       size: finalSize,
-      alpha,
+      alpha: 1,
       shape,
       color,
     });
   };
 
   const pushCutouts = (x: number, y: number, size: number, shape: DotShape) => {
-    if (random() > 0.66 || (!isClusterShape(shape) && shape !== "solid-square")) return;
+    if (random() > 0.84 && !shape.startsWith("solid-")) return;
+    if (!isClusterShape(shape) && !shape.startsWith("solid-")) return;
 
-    const holes = shape === "solid-square" ? 1 + Math.floor(random() * 3) : 1;
+    const holes = shape.startsWith("solid-") ? 2 + Math.floor(random() * 4) : 1 + Math.floor(random() * 2);
     for (let i = 0; i < holes; i += 1) {
-      const range = shape === "solid-square" ? size * 0.32 : size * 0.8;
+      const rect = rectSize({ x, y, size, alpha: 1, shape, color: settings.color });
+      const rangeX = shape.startsWith("solid-") ? rect.width * 0.36 : size * 0.8;
+      const rangeY = shape.startsWith("solid-") ? rect.height * 0.36 : size * 0.8;
       pushRawDot(
-        snapToPosterGrid(x + sampleRange(random, -range, range)),
-        snapToPosterGrid(y + sampleRange(random, -range, range)),
+        snapToPosterGrid(x + sampleRange(random, -rangeX, rangeX)),
+        snapToPosterGrid(y + sampleRange(random, -rangeY, rangeY)),
         sampleRange(random, Math.max(2.2, size * 0.22), Math.max(3, size * 0.42)),
         1,
         random() > 0.12 ? "circle" : "square",
@@ -367,9 +383,9 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
     const shouldSnap = shape !== "circle" || size > 2.6;
     const dotX = shouldSnap ? snapToPosterGrid(x) : x;
     const dotY = shouldSnap ? snapToPosterGrid(y) : y;
-    const dotSize = shape === "solid-square" ? sampleRange(random, Math.max(10, size), Math.max(14, size * 1.7)) : size;
+    const dotSize = shape.startsWith("solid-") ? sampleRange(random, Math.max(11, size), Math.max(16, size * 1.8)) : size;
 
-    pushRawDot(dotX, dotY, dotSize, alpha, shape);
+    pushRawDot(dotX, dotY, dotSize, 1, shape);
     pushCutouts(dotX, dotY, dotSize, shape);
   };
 
@@ -483,12 +499,22 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
       const px = clamp(Math.round(x + sampleRange(random, -baseStride, baseStride)), 0, width - 1);
       const py = clamp(Math.round(y + sampleRange(random, -baseStride, baseStride)), 0, height - 1);
       const index = py * width + px;
-      if (!mask[index] || edgeStrength[index] < 0.05 || random() > clamp(baseDensity * 0.38, 0.08, 0.42)) continue;
+      if (!mask[index]) continue;
+
+      const contour = edgeStrength[index] > 0.05;
+      const keepStructure = contour ? baseDensity * 0.62 : baseDensity * 0.34;
+      if (random() > clamp(keepStructure, 0.1, 0.68)) continue;
 
       const tangent = edgeAngle[index] + Math.PI / 2;
-      const axis = Math.abs(Math.cos(tangent)) > Math.abs(Math.sin(tangent)) ? 0 : Math.PI / 2;
+      const axis = contour
+        ? Math.abs(Math.cos(tangent)) > Math.abs(Math.sin(tangent))
+          ? 0
+          : Math.PI / 2
+        : random() > 0.42
+          ? Math.PI / 2
+          : 0;
       const runLength = 2 + Math.floor(random() * 4);
-      const blockSize = sampleRange(random, 9, 18);
+      const blockSize = sampleRange(random, contour ? 10 : 12, contour ? 20 : 24);
       const start = -(runLength - 1) / 2;
 
       for (let i = 0; i < runLength; i += 1) {
@@ -503,8 +529,16 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
           bx,
           by,
           blockSize * sampleRange(random, 0.85, 1.35),
-          sampleRange(random, 0.84, 1),
-          random() < 0.68 ? "solid-square" : axis === 0 ? "horizontal-line" : "vertical-line",
+          1,
+          random() < 0.7
+            ? axis === 0
+              ? "solid-horizontal-rect"
+              : "solid-vertical-rect"
+            : random() < 0.58
+              ? "solid-square"
+              : axis === 0
+                ? "horizontal-line"
+                : "vertical-line",
         );
       }
     }
