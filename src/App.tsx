@@ -30,6 +30,8 @@ type Settings = {
   density: number;
   noise: number;
   dotSize: number;
+  gridSnapping: boolean;
+  gridSize: number;
   color: string;
   background: string;
   seed: number;
@@ -43,11 +45,13 @@ type SourceImage = {
 const CANVAS_WIDTH = 1200;
 const CANVAS_HEIGHT = 880;
 const MAX_SOURCE_SIDE = 920;
-const APP_VERSION = "v2026.05.27-symbolic-ui-2";
+const APP_VERSION = "v2026.05.27-grid-symbolic-3";
 const DEFAULT_SETTINGS: Settings = {
   density: 52,
   noise: 24,
   dotSize: 8,
+  gridSnapping: true,
+  gridSize: 6,
   color: "#0B8FE8",
   background: "#F3F4F1",
   seed: 24891,
@@ -79,6 +83,11 @@ function clamp(value: number, min: number, max: number) {
 
 function sampleRange(random: () => number, min: number, max: number) {
   return min + random() * (max - min);
+}
+
+function sampleGridOffset(random: () => number, maxCells: number, gridSize: number) {
+  const cells = Math.max(0, Math.round(maxCells));
+  return (Math.floor(random() * (cells * 2 + 1)) - cells) * gridSize;
 }
 
 function pickSmallDotShape(random: () => number): DotShape {
@@ -471,7 +480,11 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
   const baseDensity = settings.density / 100;
   const noise = settings.noise / 100;
   const maxDotSize = clamp(settings.dotSize, 1, 8);
-  const posterGrid = clamp(Math.round(maxDotSize * 0.86), 4, 7);
+  const gridSize = clamp(settings.gridSize, 4, 12);
+  const posterGrid = settings.gridSnapping ? gridSize : clamp(Math.round(maxDotSize * 0.86), 4, 7);
+  const sampleStep = posterGrid * Math.max(1, Math.round(baseStride / posterGrid));
+  const edgeStep = posterGrid * Math.max(1, Math.round(baseStride * 0.42 / posterGrid));
+  const jointStep = posterGrid * Math.max(1, Math.round(baseStride * 0.72 / posterGrid));
   const flowAngle = sampleRange(random, -0.35, 0.35) + (random() > 0.5 ? 0 : Math.PI);
   const edgeDensityBoost = 3 + random() * 2;
   const jointStrength = new Float32Array(width * height);
@@ -503,13 +516,24 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
     }
   }
 
-  const snapToPosterGrid = (value: number) => Math.round(value / posterGrid) * posterGrid;
+  const snapToPosterGrid = (value: number) => {
+    if (!settings.gridSnapping) return value;
+    return clamp(Math.round((value - posterGrid / 2) / posterGrid) * posterGrid + posterGrid / 2, posterGrid / 2, Math.max(posterGrid / 2, width - posterGrid / 2));
+  };
+  const snapYToPosterGrid = (value: number) => {
+    if (!settings.gridSnapping) return value;
+    return clamp(Math.round((value - posterGrid / 2) / posterGrid) * posterGrid + posterGrid / 2, posterGrid / 2, Math.max(posterGrid / 2, height - posterGrid / 2));
+  };
+  const quantizeSize = (size: number, minCells = 1, maxCells = 6) => {
+    if (!settings.gridSnapping) return size;
+    return clamp(Math.round(size / posterGrid), minCells, maxCells) * posterGrid;
+  };
 
   const pushRawDot = (x: number, y: number, size: number, alpha: number, shape: DotShape, color = settings.color) => {
-    const cellSize = shape === "micro" ? clamp(size * 0.45, 1, 2.4) : clamp(size, 1, 8);
+    const cellSize = shape === "micro" ? quantizeSize(size * 0.45, 1, 1) : quantizeSize(size, 1, 2);
     const finalSize =
       shape === "solid-square" || shape === "solid-vertical-rect" || shape === "solid-horizontal-rect"
-        ? clamp(size, 8, 32)
+        ? quantizeSize(size, 2, 6)
         : cellSize;
 
     dots.push({
@@ -533,7 +557,7 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
       const rangeY = shape.startsWith("solid-") ? rect.height * 0.36 : size * 0.8;
       pushRawDot(
         snapToPosterGrid(x + sampleRange(random, -rangeX, rangeX)),
-        snapToPosterGrid(y + sampleRange(random, -rangeY, rangeY)),
+        snapYToPosterGrid(y + sampleRange(random, -rangeY, rangeY)),
         sampleRange(random, Math.max(2.2, size * 0.22), Math.max(3, size * 0.42)),
         1,
         random() > 0.12 ? "circle" : "square",
@@ -543,9 +567,9 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
   };
 
   const pushDot = (x: number, y: number, size: number, alpha: number, shape: DotShape) => {
-    const shouldSnap = shape !== "circle" || size > 2.6;
+    const shouldSnap = settings.gridSnapping || shape !== "circle" || size > 2.6;
     const dotX = shouldSnap ? snapToPosterGrid(x) : x;
-    const dotY = shouldSnap ? snapToPosterGrid(y) : y;
+    const dotY = shouldSnap ? snapYToPosterGrid(y) : y;
     const dotSize = shape.startsWith("solid-") ? sampleRange(random, Math.max(11, size), Math.max(16, size * 1.8)) : size;
 
     pushRawDot(dotX, dotY, dotSize, 1, shape);
@@ -558,10 +582,10 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
     return mask[forwardY * width + forwardX] ? angle + Math.PI : angle;
   };
 
-  for (let y = random() * baseStride; y < height; y += baseStride * sampleRange(random, 0.72, 1.34)) {
-    for (let x = random() * baseStride; x < width; x += baseStride * sampleRange(random, 0.68, 1.42)) {
-      const px = clamp(Math.round(x + sampleRange(random, -baseStride * 0.58, baseStride * 0.58)), 0, width - 1);
-      const py = clamp(Math.round(y + sampleRange(random, -baseStride * 0.58, baseStride * 0.58)), 0, height - 1);
+  for (let y = posterGrid / 2; y < height; y += sampleStep) {
+    for (let x = posterGrid / 2; x < width; x += sampleStep) {
+      const px = clamp(Math.round(x), 0, width - 1);
+      const py = clamp(Math.round(y), 0, height - 1);
       const index = py * width + px;
       const inMask = mask[index] === 1;
       const edge = edgeStrength[index];
@@ -583,10 +607,10 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
 
       const normal = outwardAngle(px, py, edgeAngle[index]);
       const localFlow = flowAngle + Math.sin((px + py) * 0.015 + settings.seed) * 0.32;
-      const flowDistance = Math.pow(random(), 1.5) * baseStride * (0.55 + noise * 2.8);
-      const normalDistance = scatterCandidate ? sampleRange(random, baseStride * 0.35, baseStride * 1.65) : sampleRange(random, -baseStride * 0.22, baseStride * 0.22);
-      const dotX = px + Math.cos(localFlow) * flowDistance + Math.cos(normal) * normalDistance;
-      const dotY = py + Math.sin(localFlow) * flowDistance + Math.sin(normal) * normalDistance;
+      const flowCells = Math.round((Math.pow(random(), 1.5) * baseStride * (0.55 + noise * 2.8)) / posterGrid);
+      const normalCells = scatterCandidate ? 1 + Math.floor(random() * 3) : 0;
+      const dotX = px + Math.round(Math.cos(localFlow) * flowCells + Math.cos(normal) * normalCells) * posterGrid;
+      const dotY = py + Math.round(Math.sin(localFlow) * flowCells + Math.sin(normal) * normalCells) * posterGrid;
       const size = nearEdge
         ? sampleRange(random, 1.2, Math.max(3.2, maxDotSize * 0.5))
         : joint
@@ -606,9 +630,10 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
           if (random() > baseDensity * 0.8) continue;
           const echoDistance = sampleRange(random, 0, baseStride * 0.9);
           const echoFlow = localFlow + sampleRange(random, -0.6, 0.6);
+          const echoCells = Math.round(echoDistance / posterGrid);
           pushDot(
-            px + Math.cos(echoFlow) * echoDistance + sampleRange(random, -2.5, 2.5),
-            py + Math.sin(echoFlow) * echoDistance + sampleRange(random, -2.5, 2.5),
+            px + Math.round(Math.cos(echoFlow) * echoCells) * posterGrid,
+            py + Math.round(Math.sin(echoFlow) * echoCells) * posterGrid,
             sampleRange(random, 1.2, Math.max(3.2, maxDotSize * 0.44)),
             1,
             pickSmallDotShape(random),
@@ -618,8 +643,8 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
 
       if (nearEdge && random() < 0.12 + noise * 0.12) {
         pushDot(
-          px + sampleRange(random, -baseStride * 0.4, baseStride * 0.4),
-          py + sampleRange(random, -baseStride * 0.4, baseStride * 0.4),
+          px + sampleGridOffset(random, 1, posterGrid),
+          py + sampleGridOffset(random, 1, posterGrid),
           sampleRange(random, 6, 14),
           sampleRange(random, 0.78, 1),
           "solid-square",
@@ -628,11 +653,10 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
     }
   }
 
-  const edgeStride = Math.max(2, Math.round(baseStride * 0.42));
-  for (let y = random() * edgeStride; y < height; y += edgeStride * sampleRange(random, 0.82, 1.28)) {
-    for (let x = random() * edgeStride; x < width; x += edgeStride * sampleRange(random, 0.82, 1.28)) {
-      const px = clamp(Math.round(x + sampleRange(random, -edgeStride, edgeStride)), 0, width - 1);
-      const py = clamp(Math.round(y + sampleRange(random, -edgeStride, edgeStride)), 0, height - 1);
+  for (let y = posterGrid / 2; y < height; y += edgeStep) {
+    for (let x = posterGrid / 2; x < width; x += edgeStep) {
+      const px = clamp(Math.round(x), 0, width - 1);
+      const py = clamp(Math.round(y), 0, height - 1);
       const index = py * width + px;
       if (!mask[index] || edgeStrength[index] < 0.08 || random() > clamp(baseDensity * 0.92, 0.16, 0.94)) continue;
 
@@ -641,11 +665,11 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
       const repeats = 1 + Math.floor(random() * edgeDensityBoost * 0.62);
 
       for (let i = 0; i < repeats; i += 1) {
-        const along = sampleRange(random, -baseStride * 0.7, baseStride * 0.7);
-        const lift = sampleRange(random, -baseStride * 0.18, baseStride * 0.32);
+        const along = sampleGridOffset(random, Math.round((baseStride * 0.7) / posterGrid), posterGrid);
+        const lift = sampleGridOffset(random, 1, posterGrid);
         pushDot(
-          px + Math.cos(tangent) * along + Math.cos(normal) * lift,
-          py + Math.sin(tangent) * along + Math.sin(normal) * lift,
+          px + Math.round((Math.cos(tangent) * along + Math.cos(normal) * lift) / posterGrid) * posterGrid,
+          py + Math.round((Math.sin(tangent) * along + Math.sin(normal) * lift) / posterGrid) * posterGrid,
           sampleRange(random, 1.1, Math.max(3.4, maxDotSize * 0.42)),
           1,
           pickSmallDotShape(random),
@@ -653,9 +677,10 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
       }
 
       if (random() < noise * 0.22) {
+        const scatterCells = 1 + Math.floor(random() * 4);
         pushDot(
-          px + Math.cos(normal) * sampleRange(random, baseStride * 0.85, baseStride * 2.2),
-          py + Math.sin(normal) * sampleRange(random, baseStride * 0.85, baseStride * 2.2),
+          px + Math.round(Math.cos(normal) * scatterCells) * posterGrid,
+          py + Math.round(Math.sin(normal) * scatterCells) * posterGrid,
           sampleRange(random, 1, Math.max(2.5, maxDotSize * 0.45)),
           sampleRange(random, 0.2, 0.5),
           pickParticleShape(random, "scatter"),
@@ -664,19 +689,18 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
     }
   }
 
-  const jointStride = Math.max(4, Math.round(baseStride * 0.72));
-  for (let y = random() * jointStride; y < height; y += jointStride * sampleRange(random, 0.75, 1.2)) {
-    for (let x = random() * jointStride; x < width; x += jointStride * sampleRange(random, 0.75, 1.2)) {
-      const px = clamp(Math.round(x + sampleRange(random, -jointStride, jointStride)), 0, width - 1);
-      const py = clamp(Math.round(y + sampleRange(random, -jointStride, jointStride)), 0, height - 1);
+  for (let y = posterGrid / 2; y < height; y += jointStep) {
+    for (let x = posterGrid / 2; x < width; x += jointStep) {
+      const px = clamp(Math.round(x), 0, width - 1);
+      const py = clamp(Math.round(y), 0, height - 1);
       const index = py * width + px;
       if (!mask[index] || jointStrength[index] < 0.3 || random() > clamp(baseDensity * 0.82, 0.18, 0.78)) continue;
 
       const count = 2 + Math.floor(random() * 4);
       for (let i = 0; i < count; i += 1) {
         pushDot(
-          px + sampleRange(random, -jointStride * 1.4, jointStride * 1.4),
-          py + sampleRange(random, -jointStride * 1.4, jointStride * 1.4),
+          px + sampleGridOffset(random, 2, posterGrid),
+          py + sampleGridOffset(random, 2, posterGrid),
           sampleRange(random, 2, Math.max(4, maxDotSize * 0.68)),
           1,
           random() < 0.66 ? pickSmallDotShape(random) : pickMediumClusterShape(random),
@@ -685,11 +709,11 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
     }
   }
 
-  const structuralStride = Math.max(10, baseStride * 1.7);
-  for (let y = random() * structuralStride; y < height; y += structuralStride * sampleRange(random, 0.8, 1.35)) {
-    for (let x = random() * structuralStride; x < width; x += structuralStride * sampleRange(random, 0.8, 1.35)) {
-      const px = clamp(Math.round(x + sampleRange(random, -baseStride, baseStride)), 0, width - 1);
-      const py = clamp(Math.round(y + sampleRange(random, -baseStride, baseStride)), 0, height - 1);
+  const structuralStep = posterGrid * Math.max(2, Math.round((baseStride * 1.7) / posterGrid));
+  for (let y = posterGrid / 2; y < height; y += structuralStep) {
+    for (let x = posterGrid / 2; x < width; x += structuralStep) {
+      const px = clamp(Math.round(x), 0, width - 1);
+      const py = clamp(Math.round(y), 0, height - 1);
       const index = py * width + px;
       if (!mask[index]) continue;
 
@@ -711,9 +735,9 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
       const start = -(runLength - 1) / 2;
 
       for (let i = 0; i < runLength; i += 1) {
-        const offset = (start + i) * blockSize * sampleRange(random, 0.75, 1.05);
-        const bx = px + Math.cos(axis) * offset + sampleRange(random, -2, 2);
-        const by = py + Math.sin(axis) * offset + sampleRange(random, -2, 2);
+        const offsetCells = Math.round(((start + i) * blockSize) / posterGrid);
+        const bx = px + Math.cos(axis) * offsetCells * posterGrid;
+        const by = py + Math.sin(axis) * offsetCells * posterGrid;
         const sx = clamp(Math.round(bx), 0, width - 1);
         const sy = clamp(Math.round(by), 0, height - 1);
         if (!mask[sy * width + sx] && random() > noise * 0.22) continue;
@@ -747,11 +771,11 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
     const nearest = findNearestForeground(mask, width, height, sx, sy, 8);
     if (!nearest) continue;
 
-    const angle = Math.atan2(sy - nearest.y, sx - nearest.x) + sampleRange(random, -0.75, 0.75);
-    const distance = sampleRange(random, baseStride * 0.65, baseStride * 2.4);
+    const angle = Math.atan2(sy - nearest.y, sx - nearest.x);
+    const distanceCells = 1 + Math.floor(random() * Math.max(2, Math.round((baseStride * 2.4) / posterGrid)));
     pushDot(
-      nearest.x + Math.cos(angle) * distance,
-      nearest.y + Math.sin(angle) * distance,
+      nearest.x + Math.round(Math.cos(angle) * distanceCells) * posterGrid,
+      nearest.y + Math.round(Math.sin(angle) * distanceCells) * posterGrid,
       sampleRange(random, 1, Math.max(2.5, maxDotSize * 0.55)),
       sampleRange(random, 0.22, 0.56),
       pickParticleShape(random, "scatter"),
@@ -885,6 +909,16 @@ function App() {
               <Slider label="Density" value={settings.density} min={8} max={100} onChange={(value) => updateSetting("density", value)} />
               <Slider label="Collapse / noise" value={settings.noise} min={0} max={100} suffix="%" onChange={(value) => updateSetting("noise", value)} />
               <Slider label="Dot size" value={settings.dotSize} min={1} max={8} suffix="px" onChange={(value) => updateSetting("dotSize", value)} />
+              <Slider label="Grid size" value={settings.gridSize} min={4} max={12} suffix="px" onChange={(value) => updateSetting("gridSize", value)} />
+              <label className="flex h-10 items-center justify-between rounded-md border border-slate-200 bg-slate-50 px-3 text-xs font-medium text-slate-600">
+                <span>Grid snapping</span>
+                <input
+                  type="checkbox"
+                  checked={settings.gridSnapping}
+                  onChange={(event) => updateSetting("gridSnapping", event.target.checked)}
+                  className="h-4 w-4 accent-primary"
+                />
+              </label>
             </section>
 
             <section className="grid grid-cols-2 gap-3">
