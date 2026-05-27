@@ -43,6 +43,7 @@ type SourceImage = {
 const CANVAS_WIDTH = 1200;
 const CANVAS_HEIGHT = 880;
 const MAX_SOURCE_SIDE = 920;
+const APP_VERSION = "v2026.05.27-symbolic-ui-2";
 const DEFAULT_SETTINGS: Settings = {
   density: 52,
   noise: 24,
@@ -862,6 +863,7 @@ function App() {
             <div>
               <h1 className="text-lg font-semibold tracking-normal">Blue Pixel Studio</h1>
               <p className="text-xs text-slate-500">Generative silhouette dots</p>
+              <p className="mt-1 text-[11px] font-medium text-slate-400">{APP_VERSION}</p>
             </div>
           </div>
 
