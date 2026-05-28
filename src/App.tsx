@@ -1,4 +1,4 @@
-import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, DragEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Download, ImagePlus, RefreshCcw, Shuffle, Sparkles } from "lucide-react";
 import { Button } from "./components/ui/button";
 import { Label } from "./components/ui/label";
@@ -45,7 +45,8 @@ type SourceImage = {
 const CANVAS_WIDTH = 1200;
 const CANVAS_HEIGHT = 880;
 const MAX_SOURCE_SIDE = 920;
-const APP_VERSION = "v2026.05.27-grid-matrix-4";
+const APP_VERSION = "v2026.05.28-upload-grid-5";
+const SUPPORTED_IMAGE_TYPES = ["image/png", "image/jpeg", "image/jpg", "image/webp"];
 const DEFAULT_SETTINGS: Settings = {
   density: 52,
   noise: 24,
@@ -347,6 +348,42 @@ function escapeXml(value: string) {
   });
 }
 
+function imageFromDataUrl(url: string) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("Could not load image"));
+    image.src = url;
+  });
+}
+
+async function normalizeImageFile(file: File) {
+  if (!SUPPORTED_IMAGE_TYPES.includes(file.type) && !file.type.startsWith("image/")) {
+    throw new Error("Unsupported image type");
+  }
+
+  if ("createImageBitmap" in window) {
+    const bitmap = await createImageBitmap(file, { imageOrientation: "from-image" } as ImageBitmapOptions);
+    const scale = Math.min(MAX_SOURCE_SIDE / bitmap.width, MAX_SOURCE_SIDE / bitmap.height, 1);
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+    canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("Could not prepare image");
+
+    context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    bitmap.close();
+    return imageFromDataUrl(canvas.toDataURL("image/png"));
+  }
+
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => imageFromDataUrl(String(reader.result)).then(resolve, reject);
+    reader.onerror = () => reject(new Error("Could not read image"));
+    reader.readAsDataURL(file);
+  });
+}
+
 function drawDot(context: CanvasRenderingContext2D, dot: Dot) {
   if (dot.shape === "circle") {
     context.beginPath();
@@ -532,19 +569,53 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
     }
   }
 
+  let minCellX = gridWidth;
+  let maxCellX = 0;
+  let minCellY = gridHeight;
+  let maxCellY = 0;
+  for (let cy = 0; cy < gridHeight; cy += 1) {
+    for (let cx = 0; cx < gridWidth; cx += 1) {
+      if (!cellMask[cellIndex(cx, cy)]) continue;
+      minCellX = Math.min(minCellX, cx);
+      maxCellX = Math.max(maxCellX, cx);
+      minCellY = Math.min(minCellY, cy);
+      maxCellY = Math.max(maxCellY, cy);
+    }
+  }
+
+  const silhouetteWidth = Math.max(1, maxCellX - minCellX);
+  const silhouetteHeight = Math.max(1, maxCellY - minCellY);
+  const normalizedCell = (cx: number, cy: number) => ({
+    x: (cx - minCellX) / silhouetteWidth,
+    y: (cy - minCellY) / silhouetteHeight,
+  });
+  const shouldErasePresence = (cx: number, cy: number, edge = false) => {
+    const { x, y } = normalizedCell(cx, cy);
+    const faceZone = y < 0.18 && x > 0.3 && x < 0.72;
+    const torsoCenter = y > 0.27 && y < 0.62 && x > 0.36 && x < 0.66;
+    const handZone = (x < 0.15 || x > 0.85) && y > 0.2 && y < 0.78;
+    const wave = Math.sin(cx * 0.72 + settings.seed * 0.01) + Math.sin(cy * 0.47 + settings.seed * 0.017);
+    const waveGap = edge && wave > 0.55;
+
+    if (faceZone && random() < 0.84) return true;
+    if (torsoCenter && random() < 0.72) return true;
+    if (handZone && random() < 0.78) return true;
+    return waveGap || random() < (edge ? 0.18 : 0.04);
+  };
+
   for (let cy = 0; cy < gridHeight; cy += 1) {
     for (let cx = 0; cx < gridWidth; cx += 1) {
       const index = cellIndex(cx, cy);
       if (!cellMask[index]) continue;
 
-      if (cellEdge[index] && random() < clamp(baseDensity * 1.6, 0.18, 0.95)) {
+      if (cellEdge[index] && !shouldErasePresence(cx, cy, true) && random() < clamp(baseDensity * 1.05, 0.12, 0.72)) {
         setCell(cx, cy, random() > 0.35 ? "circle" : "square");
-        if (random() < baseDensity * 0.55) {
+        if (random() < baseDensity * 0.25) {
           setCell(cx + sampleGridOffset(random, 1, 1), cy + sampleGridOffset(random, 1, 1), random() > 0.5 ? "circle" : "square");
         }
       }
 
-      if (cellJoint[index] > 0.3 && random() < clamp(baseDensity * 1.15, 0.18, 0.82)) {
+      if (cellJoint[index] > 0.3 && !shouldErasePresence(cx, cy) && random() < clamp(baseDensity * 1.15, 0.18, 0.82)) {
         const count = 2 + Math.floor(random() * 4);
         for (let i = 0; i < count; i += 1) {
           setCell(cx + sampleGridOffset(random, 2, 1), cy + sampleGridOffset(random, 2, 1), random() > 0.45 ? "circle" : "square");
@@ -557,7 +628,7 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
   for (let cy = 0; cy < gridHeight; cy += blockStep) {
     for (let cx = 0; cx < gridWidth; cx += blockStep) {
       const index = cellIndex(cx, cy);
-      if (!cellMask[index] || cellBody[index] < 0.42 || random() > clamp(baseDensity * 0.72, 0.12, 0.72)) continue;
+      if (!cellMask[index] || shouldErasePresence(cx, cy) || cellBody[index] < 0.42 || random() > clamp(baseDensity * 0.62, 0.1, 0.62)) continue;
 
       const vertical = random() > 0.42;
       const cellsWide = vertical ? 1 + Math.floor(random() * 2) : 3 + Math.floor(random() * 4);
@@ -571,7 +642,7 @@ function buildPixelArt(image: HTMLImageElement, settings: Settings) {
     const cx = Math.floor(random() * gridWidth);
     const cy = Math.floor(random() * gridHeight);
     const index = cellIndex(cx, cy);
-    if (!cellEdge[index] || random() > baseDensity) continue;
+    if (!cellEdge[index] || shouldErasePresence(cx, cy, true) || random() > baseDensity) continue;
 
     const dx = sampleGridOffset(random, 3, 1);
     const dy = sampleGridOffset(random, 3, 1);
@@ -614,6 +685,8 @@ function App() {
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [dots, setDots] = useState<Dot[]>([]);
   const [artSize, setArtSize] = useState({ width: CANVAS_WIDTH, height: CANVAS_HEIGHT });
+  const [isDragging, setIsDragging] = useState(false);
+  const [uploadError, setUploadError] = useState("");
 
   const hasImage = Boolean(sourceImage);
   const displayName = sourceImage?.name ?? "No image loaded";
@@ -662,23 +735,62 @@ function App() {
     setSettings((current) => ({ ...current, [key]: value }));
   };
 
-  const handleUpload = (event: ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
+  const processImageFile = useCallback(async (file: File | undefined) => {
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      const image = new Image();
-      image.onload = () => setSourceImage({ element: image, name: file.name });
-      image.src = String(reader.result);
-    };
-    reader.readAsDataURL(file);
+    if (!file.type.startsWith("image/")) {
+      setUploadError("Please use a PNG, JPG, or WEBP image.");
+      return;
+    }
+
+    try {
+      setUploadError("");
+      const image = await normalizeImageFile(file);
+      setSourceImage({ element: image, name: file.name || "Pasted image" });
+    } catch {
+      setUploadError("Could not load this image.");
+    }
+  }, []);
+
+  const handleUpload = (event: ChangeEvent<HTMLInputElement>) => {
+    void processImageFile(event.target.files?.[0]);
   };
+
+  const handleDrop = (event: DragEvent<HTMLElement>) => {
+    event.preventDefault();
+    setIsDragging(false);
+    void processImageFile(event.dataTransfer.files?.[0]);
+  };
+
+  const handleDragOver = (event: DragEvent<HTMLElement>) => {
+    event.preventDefault();
+    setIsDragging(true);
+  };
+
+  const handleDragLeave = (event: DragEvent<HTMLElement>) => {
+    if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+      setIsDragging(false);
+    }
+  };
+
+  useEffect(() => {
+    const handlePaste = (event: ClipboardEvent) => {
+      const file = Array.from(event.clipboardData?.files ?? []).find((item) => item.type.startsWith("image/"));
+      if (file) {
+        event.preventDefault();
+        void processImageFile(file);
+      }
+    };
+
+    window.addEventListener("paste", handlePaste);
+    return () => window.removeEventListener("paste", handlePaste);
+  }, [processImageFile]);
 
   const reset = () => {
     setSettings(DEFAULT_SETTINGS);
     setSourceImage(null);
     setDots([]);
     if (fileInputRef.current) fileInputRef.current.value = "";
+    setUploadError("");
   };
 
   const randomizeSeed = () => updateSetting("seed", Math.floor(Math.random() * 999999));
@@ -714,17 +826,26 @@ function App() {
           </div>
 
           <div className="space-y-6">
-            <section className="space-y-3">
+            <section
+              className={`space-y-3 rounded-md border border-dashed p-3 transition-colors ${
+                isDragging ? "border-primary bg-blue-50" : "border-transparent"
+              }`}
+              onDrop={handleDrop}
+              onDragOver={handleDragOver}
+              onDragLeave={handleDragLeave}
+            >
               <Label>Image</Label>
-              <input ref={fileInputRef} type="file" accept="image/*" className="hidden" onChange={handleUpload} />
+              <input ref={fileInputRef} type="file" accept="image/png,image/jpeg,image/jpg,image/webp" className="hidden" onChange={handleUpload} />
               <Button className="w-full" onClick={() => fileInputRef.current?.click()}>
                 <ImagePlus className="h-4 w-4" />
                 Upload image
               </Button>
+              <div className="text-[11px] font-medium text-slate-400">PNG / JPG / WEBP supported</div>
               <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-500">
                 <div className="truncate font-medium text-slate-700">{displayName}</div>
                 <div>{hasImage ? `${stats} dots generated` : "Bright backgrounds are removed automatically"}</div>
               </div>
+              {uploadError && <div className="text-xs font-medium text-red-500">{uploadError}</div>}
             </section>
 
             <section className="space-y-5">
